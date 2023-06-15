@@ -5,7 +5,10 @@ from typing import Any, Dict
 
 from langchain import OpenAI, PromptTemplate
 from langchain.docstore.document import Document
+from langchain.chains.llm import LLMChain
 from langchain.chains.summarize import load_summarize_chain
+from langchain.chains.combine_documents.map_rerank import MapRerankDocumentsChain
+from langchain.output_parsers.regex import RegexParser
 
 import zulip
 
@@ -52,14 +55,48 @@ def create_refine_summarizer():
     )
     return load_summarize_chain(llm, chain_type="refine", refine_prompt=refine_prompt)
 
+
+def create_map_reduce_summarizer():
+    return load_summarize_chain(llm, chain_type="map_reduce")
+
+
 def create_map_rerank_summarizer():
-    # refine_template = 
-    return load_summarize_chain(llm, chain_type="")
+    map_template_string = """Given a part of a conversation below, your job is to produce a summary of it with at most 4 words
+    and give a score from 0 to 100 on how confident you are with the answer in the following format:
+    SUMMARY:
+    SCORE:
+    {text}
+    """
+
+    output_parser = RegexParser(
+        regex=r"SUMMARY: (.+)\nSCORE: (\d+)", output_keys=["topic", "score"]
+    )
+
+    MAP_PROMPT = PromptTemplate(
+        input_variables=["text"],
+        template=map_template_string,
+        output_parser=output_parser,
+    )
+
+    map_rerank = MapRerankDocumentsChain(
+        llm_chain=LLMChain(llm=llm, prompt=MAP_PROMPT),
+        rank_key="score",
+        answer_key="topic",
+        document_variable_name="text",
+    )
+    return map_rerank
 
 
 chain_topic_generator = create_topic_generator()
+
 chain_topic_summarizer_stuff = create_stuff_summarizer()
 chain_topic_summarizer_refine = create_refine_summarizer()
+chain_topic_summarizer_map_reduce = create_map_reduce_summarizer()
+chain_topic_summarizer_map_rerank = create_map_rerank_summarizer()
+
+
+def topic_from_string(text):
+    return chain_topic_generator.run([Document(page_content=text)]).strip()
 
 
 def exit_immediately(s):
@@ -109,31 +146,61 @@ def get_answer(message):
             {"operator": "topic", "operand": topic_name},
         ],
         "client_gravatar": True,
-        "apply_markdown": True,
+        "apply_markdown": False,
     }
+
+    enabled = {"refine", "stuff_summary", "map_rerank", "map_reduce_summary"}
 
     thread_content = request_all(zulip_client, request)
     thread_formatted = []
     for msg in thread_content:
         thread_formatted.append(f"{msg['sender_full_name']} said: {msg['content']}")
 
+    print("Conversation text input from Zulip", thread_formatted)
     # texts = text_splitter.split_text(thread_txt)
     docs = [Document(page_content=t) for t in thread_formatted]
+    print(f"Prepared documents: {docs}")
 
-    # For topic
-    output = f"topic (refine): {chain_topic_summarizer_refine.run(docs).strip()}\n"
-    try:
-        output += f"topic (stuff): {chain_topic_generator.run(docs).strip()}\n"
-    except Exception:
-        output += "topic (stuff): MAX_TOKEN_EXCEEDED\n"
+    output = ""
+    if "refine" in enabled:
+        # Generate a topic using the refine summarizer
+        output += f"topic (refine): {chain_topic_summarizer_refine.run(docs).strip()}\n"
+    if "stuff" in enabled:
+        # Generate a topic using the stuff summarizer
+        try:
+            output += f"topic (stuff): {chain_topic_generator.run(docs).strip()}\n"
+        except Exception as e:
+            print(e)
+            output += "topic (stuff): MAX_TOKEN_EXCEEDED\n"
+    if "map_rerank" in enabled:
+        # Generate a topic using maprerank summarizer
+        try:
+            output += (
+                f"topic (map_rerank): {chain_topic_summarizer_map_rerank.run(docs)}\n"
+            )
+        except Exception as e:
+            print(e)
+            output += "topic (map_rerank): MAX_TOKEN_EXCEEDED\n"
 
-    # For summary
-    try:
-        summary = chain_topic_summarizer_stuff.run(docs)
-    except Exception:
-        summary = "MAX_TOKEN_EXCEEDED"
-    output += f"topic (stuff summary): {chain_topic_generator.run([Document(page_content=summary)]).strip()}\n"
-    output += "\n" + summary
+    if "stuff_summary" in enabled:
+        # Generate a summary using stuff summarizer, then generate a topic
+        try:
+            summary = chain_topic_summarizer_stuff.run(docs)
+        except Exception as e:
+            print(e)
+            summary = "MAX_TOKEN_EXCEEDED"
+        output += f"topic (stuff summary): {topic_from_string(summary)}\n"
+        output += f"\n{summary}\n"
+    if "map_reduce_summary" in enabled:
+        # Generate a summary using mapreduce summarizer, then generate a topic
+        try:
+            summary = chain_topic_summarizer_map_reduce.run(docs)
+        except Exception as e:
+            print(e)
+            summary = "MAX_TOKEN_EXCEEDED"
+        output += f"topic (map_reduce summary): {topic_from_string(summary)}\n"
+        output += f"\n{summary}\n"
+
     return output
 
 
