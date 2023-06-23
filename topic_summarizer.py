@@ -163,11 +163,11 @@ def summarize_and_generate_topic(chain, docs):
     except Exception:
         traceback.print_exc()
         return "Error in generation"
-    return f"**topic:** {topic} \n **summary:** {summary}"
+    return f"**topic:** {topic} \n\n **summary:** {summary}"
 
 
 def generate_topic_from_intro_message(chain, docs):
-    return summarize_and_generate_topic(chain, docs[:1])
+    return generate_topic(chain, docs[:1])
 
 
 def get_answer(message):
@@ -224,9 +224,8 @@ def get_answer(message):
             output.append(
                 f"**Tokens Used:** *{cb.total_tokens}*; **API Cost:** *{cb.total_cost}*; **Total Time:** *{after - before} seconds*"
             )
-            output.append("")
 
-    return "\n".join(output)
+    return "\n\n".join(output)
 
 
 # The code after this line could be simplified by https://github.com/zulip/python-zulip-api/pull/786
