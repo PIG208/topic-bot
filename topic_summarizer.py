@@ -1,10 +1,11 @@
 # Modified from https://gist.github.com/rht/c5fd97d9171a5e71863d85e47af7a7e3
-import os
 import time
+import traceback
 from typing import Any, Dict
 
 from langchain import OpenAI, PromptTemplate
 from langchain.docstore.document import Document
+from langchain.callbacks import get_openai_callback
 from langchain.chains.llm import LLMChain
 from langchain.chains.summarize import load_summarize_chain
 from langchain.chains.combine_documents.map_rerank import MapRerankDocumentsChain
@@ -12,7 +13,8 @@ from langchain.output_parsers.regex import RegexParser
 
 import zulip
 
-os.environ["OPENAI_API_KEY"] = "openai_api_key"
+# Supply the API key by setting OPENAI_API_KEY
+
 # Set the temperature to 0 for a more deterministic output
 llm = OpenAI(temperature=0)
 
@@ -39,7 +41,7 @@ def create_stuff_summarizer():
 
 def create_refine_summarizer():
     refine_template = (
-        "Your job is to produce a final summary of at most 4 words\n"
+        "Your job is to produce a final summary of a conversation\n"
         "We have provided an existing summary up to a certain point: {existing_answer}\n"
         "We have the opportunity to refine the existing summary"
         "(only if needed) with some more context below.\n"
@@ -61,10 +63,14 @@ def create_map_reduce_summarizer():
 
 
 def create_map_rerank_summarizer():
-    map_template_string = """Given a part of a conversation below, your job is to produce a summary of it with at most 4 words
-    and give a score from 0 to 100 on how confident you are with the answer in the following format:
-    SUMMARY:
-    SCORE:
+    map_template_string = """Given a part of a conversation below, your job is try to produce a possible summary
+    for the entire conversation and give an integer score from 0 to 100 on how confident
+    you are with that the summary reflects the entire conversation including the parts that are not seen,
+    in the following format where SUMMARY must be only followed by a newline before SCORE:
+    SUMMARY: 
+    SCORE: 
+    
+    ENDOFFORMAT
     {text}
     """
 
@@ -83,20 +89,21 @@ def create_map_rerank_summarizer():
         rank_key="score",
         answer_key="topic",
         document_variable_name="text",
+        return_intermediate_steps=True,
     )
     return map_rerank
 
 
-chain_topic_generator = create_topic_generator()
+chain_topic_generator_stuff = create_topic_generator()
+chain_topic_generator_map_rerank = create_map_rerank_summarizer()
 
 chain_topic_summarizer_stuff = create_stuff_summarizer()
 chain_topic_summarizer_refine = create_refine_summarizer()
 chain_topic_summarizer_map_reduce = create_map_reduce_summarizer()
-chain_topic_summarizer_map_rerank = create_map_rerank_summarizer()
 
 
 def topic_from_string(text):
-    return chain_topic_generator.run([Document(page_content=text)]).strip()
+    return chain_topic_generator_stuff.run([Document(page_content=text)]).strip()
 
 
 def exit_immediately(s):
@@ -126,7 +133,7 @@ def safe_request(cmd, *args, **kwargs):
     rsp = cmd(*args, **kwargs)
     while rsp["result"] == "error":
         if "retry-after" in rsp:
-            print("timeout hit: {}".format(rsp["retry-after"]))
+            print("Timeout hit: {}".format(rsp["retry-after"]))
             time.sleep(float(rsp["retry-after"]) + 1)
             rsp = cmd(*args, **kwargs)
         else:
@@ -135,6 +142,32 @@ def safe_request(cmd, *args, **kwargs):
 
 
 zulip_client = zulip.Client(config_file="./zuliprc")
+
+
+def generate_topic(chain, docs):
+    try:
+        topic = chain.run(docs).strip()
+    except Exception:
+        traceback.print_exc()
+        return "Error in generation"
+    return f"**topic:** {topic}"
+
+
+def summarize_and_generate_topic(chain, docs):
+    try:
+        response = chain(docs)
+        if "intermediate_steps" in response:
+            print("intermediate_steps:", response["intermediate_steps"])
+        summary = response["output_text"].strip()
+        topic = topic_from_string(summary)
+    except Exception:
+        traceback.print_exc()
+        return "Error in generation"
+    return f"**topic:** {topic} \n **summary:** {summary}"
+
+
+def generate_topic_from_intro_message(chain, docs):
+    return summarize_and_generate_topic(chain, docs[:1])
 
 
 def get_answer(message):
@@ -149,76 +182,72 @@ def get_answer(message):
         "apply_markdown": False,
     }
 
-    enabled = {"refine", "stuff_summary", "map_rerank", "map_reduce_summary"}
-
     thread_content = request_all(zulip_client, request)
     thread_formatted = []
     for msg in thread_content:
         thread_formatted.append(f"{msg['sender_full_name']} said: {msg['content']}")
 
-    print("Conversation text input from Zulip", thread_formatted)
+    print("Conversation text input from Zulip:\n{}".format("\n".join(thread_formatted)))
     # texts = text_splitter.split_text(thread_txt)
     docs = [Document(page_content=t) for t in thread_formatted]
-    print(f"Prepared documents: {docs}")
 
-    output = ""
-    if "refine" in enabled:
-        # Generate a topic using the refine summarizer
-        output += f"topic (refine): {chain_topic_summarizer_refine.run(docs).strip()}\n"
-    if "stuff" in enabled:
-        # Generate a topic using the stuff summarizer
-        try:
-            output += f"topic (stuff): {chain_topic_generator.run(docs).strip()}\n"
-        except Exception as e:
-            print(e)
-            output += "topic (stuff): MAX_TOKEN_EXCEEDED\n"
-    if "map_rerank" in enabled:
-        # Generate a topic using maprerank summarizer
-        try:
-            output += (
-                f"topic (map_rerank): {chain_topic_summarizer_map_rerank.run(docs)}\n"
+    topic_chain = {
+        "stuff": chain_topic_generator_stuff,
+    }
+    summary_chain = {
+        "refine": chain_topic_summarizer_refine,
+        "stuff": chain_topic_summarizer_stuff,
+        "map_reduce": chain_topic_summarizer_map_reduce,
+        "map_rerank": chain_topic_generator_map_rerank,
+    }
+    chain_tests = {
+        "topic": (topic_chain, generate_topic),
+        "summary": (summary_chain, summarize_and_generate_topic),
+        "summary from first message only": (
+            topic_chain,
+            generate_topic_from_intro_message,
+        ),
+    }
+
+    output = []
+    output.append(f"# Summarize #**{stream_topic}**")
+    for chain_type in chain_tests:
+        chain_map, generate_content = chain_tests[chain_type]
+        for chain_name in chain_map:
+            before = time.perf_counter()
+            with get_openai_callback() as cb:
+                print(f'Running {chain_name} ({chain_type}) for "{stream_topic}"...')
+                output.append(
+                    f"## {chain_name} ({chain_type}):\n{generate_content(chain_map[chain_name], docs).strip()}"
+                )
+            after = time.perf_counter()
+            output.append(
+                f"**Tokens Used:** *{cb.total_tokens}*; **API Cost:** *{cb.total_cost}*; **Total Time:** *{after - before} seconds*"
             )
-        except Exception as e:
-            print(e)
-            output += "topic (map_rerank): MAX_TOKEN_EXCEEDED\n"
+            output.append("")
 
-    if "stuff_summary" in enabled:
-        # Generate a summary using stuff summarizer, then generate a topic
-        try:
-            summary = chain_topic_summarizer_stuff.run(docs)
-        except Exception as e:
-            print(e)
-            summary = "MAX_TOKEN_EXCEEDED"
-        output += f"topic (stuff summary): {topic_from_string(summary)}\n"
-        output += f"\n{summary}\n"
-    if "map_reduce_summary" in enabled:
-        # Generate a summary using mapreduce summarizer, then generate a topic
-        try:
-            summary = chain_topic_summarizer_map_reduce.run(docs)
-        except Exception as e:
-            print(e)
-            summary = "MAX_TOKEN_EXCEEDED"
-        output += f"topic (map_reduce summary): {topic_from_string(summary)}\n"
-        output += f"\n{summary}\n"
-
-    return output
+    return "\n".join(output)
 
 
 # The code after this line could be simplified by https://github.com/zulip/python-zulip-api/pull/786
 def handle_message(msg: Dict[str, Any]) -> None:
-    print("processing", msg)
+    print(f"Processing\n{msg}")
     if msg["type"] != "stream":
         return
 
     message = msg["content"]
-    content = get_answer(message)
+    try:
+        content = get_answer(message)
+    except Exception:
+        traceback.print_exc()
+        content = "Failed to process message {}".format(msg["content"])
     request = {
         "type": "stream",
         "to": msg["display_recipient"],
         "topic": msg["subject"],
         "content": content,
     }
-    print("sending", content)
+    print(f"Sending\n{content}")
     zulip_client.send_message(request)
 
 
@@ -238,6 +267,27 @@ def watch_messages() -> None:
     )
 
 
+def generate_answers():
+    questions = [
+        # Short conversations
+        "#**api documentation>user activity**",
+        "#**api documentation>security scheme validation/testing**",
+        '#**issues>visual notification on despite setting "Do not disturb"**',
+        "#**design>@topic mention**",
+        # Long conversations
+        "#**design>Mark all messages as read.**",
+        "#**feedback>issues link in description**",
+        "#**design>Profile button**",
+        # Extra long conversations
+        "#**api documentation>prev_stream in message history**",
+        "#**api design>Previewable URL Api**",
+    ]
+    for question in questions:
+        content = get_answer(question)
+        with open("output.log", "+a") as f:
+            f.write(content + "\n")
+
 # If you want to test directly:
-# get_answer("@**bot** #**integrations>docs question answer llm bot**")
+# generate_answers()
+# Run the summarizer as an interactive bot
 watch_messages()
